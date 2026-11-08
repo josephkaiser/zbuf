@@ -1,0 +1,8 @@
+# built by install.sh
+zbuf-index.dylib
+zbuf-index.so
+zbuf-index.*.new
+zathura
+.DS_Store
+*.swp
+*~

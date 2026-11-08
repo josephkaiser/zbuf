@@ -1,0 +1,271 @@
+#!/bin/sh
+# zbuf: buffer list for a single zathura instance, driven over a private D-Bus.
+#
+#   zbuf [file...]     start a session, or add files to the running one;
+#                      with no files, reopens the last document you read
+#   zbuf next|prev     switch buffer
+#   zbuf close         drop the current buffer
+#   zbuf list          print buffers (* marks the current one)
+#   zbuf quit          stop the session
+#
+# Inside zathura: b lists open buffers, o lists files in the current folder
+# (j/k move, Enter opens, - goes up, q closes; see zbuf-index.c), gt/gT
+# next/prev, gd close. Tab is still the document's own index.
+
+set -eu
+
+# resolve symlinks so zbuf-index.c is found when zbuf is linked onto PATH
+SELF=$(realpath "$0")
+HERE=$(dirname "$SELF")
+# unix socket paths max out around 104 chars on macOS, so keep this short
+DIR=${ZBUF_DIR:-/tmp/zbuf-$(id -u)}
+LIST=$DIR/buffers
+# install.sh may leave a zathura to use next to zbuf (on macOS, one inside an
+# app bundle so it gets an icon and name)
+[ -x "$HERE/zathura" ] && ZATHURA=$(realpath "$HERE/zathura") || ZATHURA=zathura
+ZATHURA=${ZBUF_ZATHURA:-$ZATHURA}
+HISTORY=${ZBUF_HISTORY:-${XDG_DATA_HOME:-$HOME/.local/share}/zathura/bookmarks.sqlite}
+# zbuf-index.c, built by install.sh and preloaded into zbuf's zathura only
+case $(uname) in
+Darwin) PLUGIN=$HERE/zbuf-index.dylib PRELOAD=DYLD_INSERT_LIBRARIES ;;
+*) PLUGIN=$HERE/zbuf-index.so PRELOAD=LD_PRELOAD ;;
+esac
+# INT_MIN tells OpenDocument to restore the page from zathura's history
+PAGE_FROM_HISTORY=-2147483648
+
+die() { echo "zbuf: $*" >&2; exit 1; }
+
+alive() {
+  [ -f "$DIR/state" ] || return 1
+  . "$DIR/state"
+  kill -0 "$ZPID" 2>/dev/null
+}
+
+zcall() {
+  dbus-send --session --print-reply --dest="org.pwmt.zathura.PID-$ZPID" /org/pwmt/zathura "$@"
+}
+
+current() {
+  zcall org.freedesktop.DBus.Properties.Get string:org.pwmt.zathura string:filename 2>/dev/null |
+    sed -n 's/^ *variant *string "\(.*\)"$/\1/p'
+}
+
+open_doc() {
+  zcall org.pwmt.zathura.OpenDocument string:"$1" string: int32:$PAGE_FROM_HISTORY >/dev/null
+}
+
+# OpenDocument returns before zathura loads the file, so wait for it to show up
+opened() {
+  i=0
+  while [ $i -lt 30 ]; do
+    [ "$(current)" = "$1" ] && return 0
+    i=$((i + 1))
+    sleep 0.1
+  done
+  return 1
+}
+
+# realpath takes a leading - for an option
+abspath() {
+  case $1 in -*) set -- "./$1" ;; esac
+  realpath "$1"
+}
+
+add() {
+  grep -qxF "$1" "$LIST" || printf '%s\n' "$1" >>"$LIST"
+}
+
+drop() {
+  grep -vxF "$1" "$LIST" >"$LIST.tmp" || true
+  mv "$LIST.tmp" "$LIST"
+}
+
+# zathura can open files without us (o, O), so pick those up on every call,
+# and forget files that were deleted or moved
+sync_current() {
+  CUR=$(current)
+  [ -n "$CUR" ] && add "$CUR"
+  while IFS= read -r f; do
+    [ -f "$f" ] || drop "$f"
+  done <"$LIST"
+}
+
+# show a buffer and wait until it is up. zathura drops the current document
+# before it finds out it cannot open the new one, so on failure put the old
+# one back rather than leave the window empty
+show() {
+  was=$(current)
+  open_doc "$1"
+  opened "$1" && return 0
+  drop "$1"
+  back=${was:-$(head -n 1 "$LIST")}
+  [ -n "$back" ] && [ "$back" != "$1" ] && open_doc "$back"
+  return 1
+}
+
+# one zbuf at a time, so two files opened together cannot start two sessions
+lock() {
+  i=0
+  until mkdir "$DIR.lock" 2>/dev/null; do
+    # a zbuf that was killed leaves its lock behind
+    holder=$(cat "$DIR.lock/pid" 2>/dev/null) || holder=
+    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+      rm -rf "$DIR.lock"
+      continue
+    fi
+    i=$((i + 1))
+    [ $i -gt 300 ] && die "another zbuf is still running"
+    sleep 0.05
+  done
+  echo $$ >"$DIR.lock/pid"
+  trap 'rm -rf "$DIR.lock"' EXIT
+}
+
+# the document most recently closed in zathura, if it still exists
+last_read() {
+  [ -f "$HISTORY" ] || return 0
+  sqlite3 -readonly "$HISTORY" "SELECT file FROM fileinfo ORDER BY time DESC LIMIT 20" 2>/dev/null |
+    while IFS= read -r f; do
+      [ -f "$f" ] && { printf '%s\n' "$f"; break; }
+    done
+}
+
+# rebuild the plugin when the source changes (or zathura's headers move on)
+build_plugin() {
+  [ -f "$PLUGIN" ] && [ "$PLUGIN" -nt "$HERE/zbuf-index.c" ] && return 0
+  "$HERE/install.sh" build || die "could not build the plugin"
+}
+
+start() {
+  build_plugin
+
+  rm -rf "$DIR"
+  mkdir -m 700 "$DIR"
+  : >"$LIST"
+
+  out=$(dbus-daemon --session --address="unix:path=$DIR/bus" --fork --print-address=1 --print-pid=1)
+  DBUS_SESSION_BUS_ADDRESS=$(echo "$out" | sed -n 1p)
+  DPID=$(echo "$out" | sed -n 2p)
+  export DBUS_SESSION_BUS_ADDRESS
+
+  {
+    user=${XDG_CONFIG_HOME:-$HOME/.config}/zathura/zathurarc
+    [ -f "$user" ] && echo "include $user"
+    echo 'set page-cache-size 2'
+    echo 'set window-title-basename true'
+    echo 'set statusbar-basename true'
+    echo "map b exec \"$SELF menu buffers\""
+    echo "map o exec \"$SELF menu files\""
+    echo "map gt exec \"$SELF next\""
+    echo "map gT exec \"$SELF prev\""
+    echo "map gd exec \"$SELF close\""
+  } >"$DIR/zathurarc"
+
+  # the supervisor owns zathura and tears the bus down when it exits
+  (
+    trap '' HUP
+    # the plugin takes itself back out of the environment, so what zathura runs doesn't get it
+    preload=$(printenv "$PRELOAD" || true)
+    env "$PRELOAD=$PLUGIN${preload:+:$preload}" ZBUF_DIR="$DIR" ZBUF_BIN="$SELF" \
+      "$ZATHURA" -c "$DIR" >/dev/null 2>&1 &
+    zpid=$!
+    printf 'ZPID=%s\nDPID=%s\nexport DBUS_SESSION_BUS_ADDRESS=%s\n' \
+      "$zpid" "$DPID" "$DBUS_SESSION_BUS_ADDRESS" >"$DIR/state.tmp"
+    mv "$DIR/state.tmp" "$DIR/state"
+    wait $zpid || true
+    kill "$DPID" 2>/dev/null || true
+    rm -rf "$DIR"
+  ) </dev/null >/dev/null 2>&1 &
+
+  i=0
+  until [ -f "$DIR/state" ] && . "$DIR/state" && zcall org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1; do
+    i=$((i + 1))
+    [ $i -gt 50 ] && die "zathura did not come up on the bus"
+    sleep 0.1
+  done
+}
+
+# print the buffer $2 steps away from $1 (wrapping), or nothing if none
+# (paths go through the environment: awk -v would eat backslashes)
+neighbour() {
+  ZBUF_CUR=$1 awk -v step="$2" '
+    BEGIN { cur = ENVIRON["ZBUF_CUR"] }
+    { f[NR] = $0; if ($0 == cur) i = NR }
+    END { if (NR && i) print f[(i - 1 + step + NR) % NR + 1]; else if (NR) print f[1] }
+  ' "$LIST"
+}
+
+cmd=${1-}
+case $cmd in -h | --help) ;; *) lock ;; esac
+case $cmd in
+next | prev)
+  alive || die "no session"
+  sync_current
+  [ "$cmd" = next ] && step=1 || step=-1
+  to=$(neighbour "$CUR" $step)
+  if [ -n "$to" ] && [ "$to" != "$CUR" ]; then
+    show "$to" || die "zathura could not open $to"
+  fi
+  ;;
+close)
+  alive || die "no session"
+  sync_current
+  to=$(neighbour "$CUR" 1)
+  drop "$CUR"
+  if [ -s "$LIST" ] && [ "$to" != "$CUR" ]; then
+    show "$to" || die "zathura could not open $to"
+  else
+    zcall org.pwmt.zathura.CloseDocument >/dev/null 2>&1 || true
+  fi
+  ;;
+list)
+  alive || die "no session"
+  sync_current
+  ZBUF_CUR=$CUR awk 'BEGIN { cur = ENVIRON["ZBUF_CUR"] } { printf "%s %d %s\n", ($0 == cur ? "*" : " "), NR, $0 }' "$LIST"
+  ;;
+menu)
+  # zbuf-index.c draws the menus inside zathura; these signals open them
+  alive || die "no session"
+  sync_current
+  case ${2-} in
+  buffers) kill -USR1 "$ZPID" ;;
+  files) kill -USR2 "$ZPID" ;;
+  *) die "usage: zbuf menu buffers|files" ;;
+  esac
+  ;;
+quit)
+  alive || die "no session"
+  kill "$ZPID"
+  ;;
+-h | --help)
+  sed -n '2,/^[^#]/s/^# \{0,1\}//p' "$SELF"
+  ;;
+*)
+  fresh=
+  if alive; then
+    sync_current
+  else
+    if [ $# -eq 0 ]; then
+      recent=$(last_read)
+      [ -n "$recent" ] || die "nothing to reopen; give a file"
+      set -- "$recent"
+    fi
+    for f in "$@"; do
+      [ -f "$f" ] || die "no such file: $f"
+    done
+    start
+    fresh=1
+  fi
+  last=
+  for f in "$@"; do
+    [ -f "$f" ] || die "no such file: $f"
+    last=$(abspath "$f")
+    add "$last"
+  done
+  if [ -n "$last" ] && ! show "$last"; then
+    # a session that never showed anything is just an empty window
+    [ -n "$fresh" ] && [ ! -s "$LIST" ] && kill "$ZPID"
+    die "zathura could not open $last"
+  fi
+  ;;
+esac
