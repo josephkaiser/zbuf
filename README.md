@@ -1,3 +1,5 @@
+<img src="icon.png" alt="zbuf icon" width="128" align="right">
+
 # zbuf
 
 One zathura window, many documents. zbuf keeps a single zathura pane open and 
