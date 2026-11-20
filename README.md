@@ -46,8 +46,13 @@ tells you if no PDF plugin is found.
 
 ```sh
 zbuf paper.pdf book.epub   # start, or add files to the running window
-zbuf                       # reopen the last document you read
+zbuf                       # reopen what you had open last time
 ```
+
+Closing the window keeps its buffer list. The next session starts with those
+buffers again, oldest read first, and leaves out files that are gone or that
+you haven't read in 30 days (`ZBUF_KEEP_DAYS` changes that). Starting with no
+files shows the one you read last.
 
 In the window:
 
@@ -65,6 +70,20 @@ a folder, `~` goes home, `b`/`o` swap menus, `q` or `Esc` closes.
 From a shell: `zbuf next`, `zbuf prev`, `zbuf close`, `zbuf list`, `zbuf quit`.
 
 Pages are remembered per file by zathura's own history, as usual.
+
+## EPUBs with math (macOS)
+
+MuPDF has no MathML support, so equations in EPUBs come out as a flat run of
+symbols. On macOS, `./install.sh` also builds `zathura-epub-webkit/`, and zbuf
+opens EPUBs through it instead: WebKit, the engine behind Safari and Apple
+Books, lays the book out into pages, so equations, SVG and modern CSS look the
+way they do in Apple Books, and each chapter scrolls as one column (zbuf drops
+the gap between pages while an EPUB is up). MuPDF still opens PDFs. An open
+EPUB costs about 125 MB (WebKit runs in its own processes); the first open of a
+book takes a couple of seconds to lay it out, later opens are instant. Page
+numbers differ from MuPDF's, so a position saved under MuPDF lands a little off
+once. If the plugin isn't built, EPUBs open with MuPDF as before. Set
+`ZBUF_EPUB_PLUGIN` to use a build somewhere else.
 
 ## Memory Footprint
 
@@ -97,6 +116,9 @@ flat as you open more files, because only the shown document is kept.
   zathura inside it, so the window shows as "zathura + zbuf" with zbuf's own
   icon in Cmd-Tab and the Dock. The copy is refreshed by `./install.sh`, so
   rerun it after upgrading zathura.
+- `zathura-epub-webkit/` (macOS) is a zathura plugin for EPUBs: `plugin.c`
+  pipes pages from `helper.swift`, which lays the book out in WebKit. zbuf adds
+  it to its own zathura's plugin path only. See its README.
 
 Upgrading from an earlier zbuf that replaced Homebrew's mupdf plugin: run
 `./install.sh` and it puts mupdf back.

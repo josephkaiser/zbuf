@@ -26,6 +26,7 @@
 #include <gmodule.h>
 #include <gtk/gtk.h>
 #include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <zathura/plugin-api.h>
@@ -471,7 +472,31 @@ static gboolean on_closed(gpointer UNUSED(d)) {
   return G_SOURCE_REMOVE;
 }
 
+/* files zathura opens on its own (:open) go on the buffer list too, so it
+ * is complete without waiting for zbuf's next call */
+static void remember(const char* path) {
+  g_autofree char* real = realpath(path, NULL);
+  if (real == NULL) {
+    return;
+  }
+  g_autofree char* list = g_build_filename(g_getenv("ZBUF_DIR"), "buffers", NULL);
+  g_autofree char* text = NULL;
+  g_file_get_contents(list, &text, NULL, NULL);
+  g_auto(GStrv) lines = g_strsplit(text != NULL ? text : "", "\n", -1);
+  if (g_strv_contains((const char* const*)lines, real)) {
+    return;
+  }
+  FILE* f = fopen(list, "a");
+  if (f != NULL) {
+    fprintf(f, "%s\n", real);
+    fclose(f);
+  }
+}
+
 static gboolean bring_forward(gpointer UNUSED(d)) {
+  if (current_doc != NULL) {
+    remember(current_doc);
+  }
   update_position();
   GList* tops = gtk_window_list_toplevels();
   for (GList* l = tops; l != NULL; l = l->next) {
@@ -487,8 +512,7 @@ static gboolean bring_forward(gpointer UNUSED(d)) {
 
 static zathura_plugin_definition_t wrapped; /* the PDF plugin's definition, with our open and free */
 
-static zathura_error_t document_open(zathura_document_t* document) {
-  zathura_error_t err = inner_open(document);
+static zathura_error_t opened(zathura_document_t* document, zathura_error_t err) {
   if (err == ZATHURA_ERROR_OK) {
     g_free(current_doc);
     current_doc = g_strdup(zathura_document_get_path(document));
@@ -497,18 +521,123 @@ static zathura_error_t document_open(zathura_document_t* document) {
   return err;
 }
 
-static zathura_error_t document_free(zathura_document_t* document, void* data) {
+static void freed(zathura_document_t* document) {
   /* a newer document may already be up when the old one is freed */
   if (g_strcmp0(zathura_document_get_path(document), current_doc) == 0) {
     g_clear_pointer(&current_doc, g_free);
     g_idle_add(on_closed, NULL);
   }
+}
+
+/* Gap between pages: none for an EPUB the WebKit plugin lays out as one scrolling
+ * column cut into strips (so the strips read as one page), your page-v-padding
+ * (ZBUF_PAGE_GAP, from zathurarc) for everything else. Zathura's settings are set
+ * through its own D-Bus ExecuteCommand, which zbuf already relies on. */
+static void set_page_gap(bool none) {
+  static int current = -1; /* unknown */
+  if (current == (int)none) {
+    return;
+  }
+  current = none;
+  const char* gap = none ? "0" : (g_getenv("ZBUF_PAGE_GAP") != NULL ? g_getenv("ZBUF_PAGE_GAP") : "1");
+  GDBusConnection* bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, NULL);
+  if (bus == NULL) {
+    return;
+  }
+  g_autofree char* name = g_strdup_printf("org.pwmt.zathura.PID-%d", (int)getpid());
+  g_autofree char* cmd  = g_strdup_printf("set page-v-padding %s", gap);
+  g_dbus_connection_call(bus, name, "/org/pwmt/zathura", "org.pwmt.zathura", "ExecuteCommand",
+                         g_variant_new("(s)", cmd), NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, NULL, NULL);
+  g_object_unref(bus);
+}
+
+static bool epub_shown; /* the document on screen is a WebKit EPUB */
+
+static zathura_error_t document_open(zathura_document_t* document) {
+  epub_shown          = false; /* a PDF keeps whatever zoom you give it */
+  zathura_error_t err = opened(document, inner_open(document));
+  if (err == ZATHURA_ERROR_OK && g_getenv("ZBUF_DIR") != NULL) {
+    set_page_gap(false);
+  }
+  return err;
+}
+
+static zathura_error_t document_free(zathura_document_t* document, void* data) {
+  freed(document);
   return inner_free != NULL ? inner_free(document, data) : ZATHURA_ERROR_OK;
 }
 
-static bool opens_pdf(const zathura_plugin_definition_t* def) {
+/* the WebKit EPUB plugin (zathura-epub-webkit), when zbuf adds it: it gets
+ * EPUBs instead of the PDF plugin, and its documents are tracked the same way */
+#define EPUB_TYPE "application/epub+zip"
+static zathura_plugin_definition_t wrapped_epub;
+static zathura_plugin_document_open_t epub_open;
+static zathura_plugin_document_free_t epub_free;
+static const char** pdf_types; /* the PDF plugin's types without EPUB */
+
+/* ---- EPUBs open fitted to the window's width ----
+ * As if you pressed s (adjust to width) when a book opens: zathura reopens a book at the
+ * zoom its history saved rather than fitted, which leaves bars beside the page. Once it's
+ * fitted, zathura keeps it fitted while the window is resized. zathura has no command or
+ * D-Bus call for this, so it gets the key. */
+
+static void fit_width(void) {
+  GList* tops = gtk_window_list_toplevels();
+  for (GList* l = tops; l != NULL && stack == NULL; l = l->next) {
+    if (gtk_widget_get_visible(l->data)) {
+      stack = find_stack(l->data);
+    }
+  }
+  g_list_free(tops);
+  GdkWindow* win = stack != NULL ? gtk_widget_get_window(gtk_widget_get_toplevel(stack)) : NULL;
+  if (win == NULL || shown != MENU_NONE) {
+    return; /* no window yet, or a menu would take the key */
+  }
+  GdkDisplay* display = gdk_window_get_display(win);
+  GdkEvent* ev        = gdk_event_new(GDK_KEY_PRESS);
+  ev->key.window      = g_object_ref(win);
+  ev->key.send_event  = TRUE;
+  ev->key.time        = GDK_CURRENT_TIME;
+  ev->key.keyval      = GDK_KEY_s;
+  /* girara reads the key from its hardware code */
+  GdkKeymapKey* keys = NULL;
+  gint n             = 0;
+  if (gdk_keymap_get_entries_for_keyval(gdk_keymap_get_for_display(display), GDK_KEY_s, &keys, &n) && n > 0) {
+    ev->key.hardware_keycode = keys[0].keycode;
+    ev->key.group            = keys[0].group;
+  }
+  g_free(keys);
+  gdk_event_set_device(ev, gdk_seat_get_keyboard(gdk_display_get_default_seat(display)));
+  gtk_main_do_event(ev);
+  gdk_event_free(ev);
+}
+
+static gboolean fit_opened(gpointer UNUSED(d)) {
+  if (epub_shown) {
+    fit_width();
+  }
+  return G_SOURCE_REMOVE;
+}
+
+static zathura_error_t epub_document_open(zathura_document_t* document) {
+  zathura_error_t err = opened(document, epub_open(document));
+  epub_shown          = err == ZATHURA_ERROR_OK;
+  if (err == ZATHURA_ERROR_OK && g_getenv("ZBUF_DIR") != NULL) {
+    set_page_gap(g_strcmp0(g_getenv("ZATHURA_EPUB_WEBKIT_MODE"), "scroll") == 0);
+    /* after zathura has put the book on screen at its saved zoom */
+    g_timeout_add(100, fit_opened, NULL);
+  }
+  return err;
+}
+
+static zathura_error_t epub_document_free(zathura_document_t* document, void* data) {
+  freed(document);
+  return epub_free != NULL ? epub_free(document, data) : ZATHURA_ERROR_OK;
+}
+
+static bool opens(const zathura_plugin_definition_t* def, const char* type) {
   for (size_t i = 0; i < def->mime_types_size; i++) {
-    if (g_strcmp0(def->mime_types[i], "application/pdf") == 0) {
+    if (g_strcmp0(def->mime_types[i], type) == 0) {
       return true;
     }
   }
@@ -516,21 +645,43 @@ static bool opens_pdf(const zathura_plugin_definition_t* def) {
 }
 
 /* zathura loads each plugin with g_module_open and fetches its definition with
- * this; hand back our copy for the first plugin that opens PDFs */
+ * this; hand back our copy for the first plugin that opens PDFs, and for the
+ * WebKit EPUB plugin */
 static gboolean find_symbol(GModule* module, const gchar* name, gpointer* symbol,
                             gboolean (*real)(GModule*, const gchar*, gpointer*)) {
   if (!real(module, name, symbol)) {
     return FALSE;
   }
   const zathura_plugin_definition_t* def = *symbol;
-  if (inner_open == NULL && strcmp(name, G_STRINGIFY(ZATHURA_PLUGIN_DEFINITION_SYMBOL)) == 0 && def != NULL &&
-      def->functions.document_open != NULL && opens_pdf(def)) {
+  if (strcmp(name, G_STRINGIFY(ZATHURA_PLUGIN_DEFINITION_SYMBOL)) != 0 || def == NULL ||
+      def->functions.document_open == NULL) {
+    return TRUE;
+  }
+  bool epub_webkit = g_getenv("ZBUF_EPUB_WEBKIT") != NULL;
+  if (epub_open == NULL && epub_webkit && g_strcmp0(def->name, "epub-webkit") == 0) {
+    memcpy(&wrapped_epub, def, sizeof(wrapped_epub));
+    epub_open                             = def->functions.document_open;
+    epub_free                             = def->functions.document_free;
+    wrapped_epub.functions.document_open = epub_document_open;
+    wrapped_epub.functions.document_free = epub_document_free;
+    *symbol                               = &wrapped_epub;
+  } else if (inner_open == NULL && opens(def, "application/pdf")) {
     memcpy(&wrapped, def, sizeof(wrapped));
     inner_open                       = def->functions.document_open;
     inner_free                       = def->functions.document_free;
     wrapped.functions.document_open = document_open;
     wrapped.functions.document_free = document_free;
-    *symbol                          = &wrapped;
+    /* zathura gives a type to the first plugin that claims it, and the PDF
+     * plugin's folder is read first; leave EPUB for the WebKit plugin */
+    /* (the count is const, so EPUB's slot repeats PDF, which zathura skips as already registered) */
+    if (epub_webkit && opens(def, EPUB_TYPE)) {
+      pdf_types = g_new0(const char*, def->mime_types_size);
+      for (size_t i = 0; i < def->mime_types_size; i++) {
+        pdf_types[i] = g_strcmp0(def->mime_types[i], EPUB_TYPE) == 0 ? "application/pdf" : def->mime_types[i];
+      }
+      wrapped.mime_types = pdf_types;
+    }
+    *symbol = &wrapped;
   }
   return TRUE;
 }

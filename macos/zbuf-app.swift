@@ -7,7 +7,7 @@
 //   zbuf.app/Contents/MacOS/zbuf-app --set-default type bundle-id
 //     make bundle-id the app that opens type
 //
-// install.sh uses these to make zbuf the PDF/EPUB viewer when asked, and to
+// install.sh uses these to make zbuf the PDF/EPUB/MOBI viewer when asked, and to
 // put the previous viewer back on uninstall.
 
 import AppKit

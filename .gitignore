@@ -4,5 +4,7 @@ zbuf-index.so
 zbuf-index.*.new
 zathura
 .DS_Store
+# built by zathura-epub-webkit/build.sh
+zathura-epub-webkit/plugin/
 *.swp
 *~

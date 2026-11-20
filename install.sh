@@ -6,7 +6,7 @@
 #
 #   ./install.sh             install (safe to rerun, e.g. after a zathura upgrade)
 #   ./install.sh uninstall   undo all of that
-#   ./install.sh default     make zbuf the default PDF/EPUB viewer (asks first)
+#   ./install.sh default     make zbuf the default PDF/EPUB/MOBI viewer (asks first)
 #   ./install.sh build       only build the library (zbuf runs this itself)
 #
 # install asks before making zbuf the default viewer, and only when run in a
@@ -30,14 +30,15 @@ Darwin)
   PLUGIN=$HERE/zbuf-index.dylib
   APP=${APPDIR:-$HOME/Applications}/zbuf.app
   APPID=local.zbuf
-  TYPES="com.adobe.pdf org.idpf.epub-container"
+  # macOS has no type for .mobi; zbuf.app declares local.zbuf.mobi
+  TYPES="com.adobe.pdf org.idpf.epub-container local.zbuf.mobi"
   ;;
 *)
   OS=xdg
   PLUGIN=$HERE/zbuf-index.so
   APPS=${XDG_DATA_HOME:-$HOME/.local/share}/applications
   DESKTOP=zbuf.desktop
-  TYPES="application/pdf application/epub+zip"
+  TYPES="application/pdf application/epub+zip application/x-mobipocket-ebook"
   ;;
 esac
 
@@ -104,7 +105,12 @@ old_mupdf_hint() {
 
 launcher_install() {
   case $OS in
-  macos) "$HERE/macos/install.sh" install ;;
+  macos)
+    "$HERE/macos/install.sh" install
+    # EPUBs open through WebKit when this is built, so MathML equations render
+    "$HERE/zathura-epub-webkit/build.sh" ||
+      echo "note: the WebKit EPUB plugin did not build; EPUBs open with MuPDF" >&2
+    ;;
   xdg)
     mkdir -p "$APPS"
     cat >"$APPS/$DESKTOP" <<EOF
@@ -127,7 +133,10 @@ EOF
 
 launcher_uninstall() {
   case $OS in
-  macos) "$HERE/macos/install.sh" uninstall ;;
+  macos)
+    "$HERE/macos/install.sh" uninstall
+    "$HERE/zathura-epub-webkit/build.sh" clean
+    ;;
   xdg)
     rm -f "$APPS/$DESKTOP"
     command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" 2>/dev/null || true
@@ -161,10 +170,10 @@ ask_default() {
   answer=${ZBUF_DEFAULT-}
   if [ -z "$answer" ]; then
     if ! [ -t 0 ]; then
-      echo "To open PDF and EPUB files in zbuf by default: $0 default"
+      echo "To open PDF, EPUB and MOBI files in zbuf by default: $0 default"
       return 0
     fi
-    printf 'Open PDF and EPUB files in zbuf by default? Your current viewer is put back on uninstall. [y/N] '
+    printf 'Open PDF, EPUB and MOBI files in zbuf by default? Your current viewer is put back on uninstall. [y/N] '
     read -r answer || answer=
   fi
   case $answer in
@@ -182,7 +191,7 @@ make_default() {
     grep -q "^$type " "$PREVIOUS" 2>/dev/null || printf '%s %s\n' "$type" "$was" >>"$PREVIOUS"
     set_default "$type" "$(ours)"
   done
-  echo "zbuf is now the default viewer for PDF and EPUB"
+  echo "zbuf is now the default viewer for PDF, EPUB and MOBI"
 }
 
 restore_default() {
@@ -200,7 +209,7 @@ restore_default() {
   done <"$PREVIOUS"
   rm -f "$PREVIOUS"
   rmdir "$STATE" 2>/dev/null || true
-  echo "restored your previous PDF/EPUB viewer"
+  echo "restored your previous PDF/EPUB/MOBI viewer"
 }
 
 # ---- commands ----
@@ -226,6 +235,8 @@ default)
   ;;
 uninstall)
   restore_default
+  rm -f "$STATE/buffers"
+  rmdir "$STATE" 2>/dev/null || true
   launcher_uninstall
   undo_old_layout
   # only our link, not some other zbuf

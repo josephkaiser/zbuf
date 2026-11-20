@@ -2,7 +2,7 @@
 # macOS part of zbuf's install, run by ../install.sh. Builds zbuf.app:
 #
 #   zbuf.app                          windowless launcher that Finder can open
-#                                     PDF/EPUB with; hands files to zbuf
+#                                     PDF/EPUB/MOBI with; hands files to zbuf
 #   zbuf.app/Contents/Helpers/zathura.app
 #                                     a copy of zathura (from Homebrew) in a bundle
 #                                     of its own, so its window shows up in
@@ -55,7 +55,20 @@ install() {
       <key>CFBundleTypeName</key><string>Document</string>
       <key>CFBundleTypeRole</key><string>Viewer</string>
       <key>LSItemContentTypes</key>
-      <array><string>com.adobe.pdf</string><string>org.idpf.epub-container</string></array>
+      <array><string>com.adobe.pdf</string><string>org.idpf.epub-container</string><string>local.zbuf.mobi</string></array>
+    </dict>
+  </array>
+  <key>UTImportedTypeDeclarations</key>
+  <array>
+    <dict>
+      <key>UTTypeIdentifier</key><string>local.zbuf.mobi</string>
+      <key>UTTypeDescription</key><string>Mobipocket e-book</string>
+      <key>UTTypeConformsTo</key><array><string>public.data</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key><array><string>mobi</string></array>
+        <key>public.mime-type</key><array><string>application/x-mobipocket-ebook</string></array>
+      </dict>
     </dict>
   </array>' >"$APP/Contents/Info.plist"
 

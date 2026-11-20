@@ -1,8 +1,11 @@
 #!/bin/sh
 # zbuf: buffer list for a single zathura instance, driven over a private D-Bus.
 #
-#   zbuf [file...]     start a session, or add files to the running one;
-#                      with no files, reopens the last document you read
+#   zbuf [file...]     start a session, or add files to the running one.
+#                      A new session brings back the buffers you had open
+#                      when the last one closed (oldest read first, any not
+#                      read in ZBUF_KEEP_DAYS days left out, default 30);
+#                      with no files it shows the one you read last
 #   zbuf next|prev     switch buffer
 #   zbuf close         drop the current buffer
 #   zbuf list          print buffers (* marks the current one)
@@ -25,11 +28,17 @@ LIST=$DIR/buffers
 [ -x "$HERE/zathura" ] && ZATHURA=$(realpath "$HERE/zathura") || ZATHURA=zathura
 ZATHURA=${ZBUF_ZATHURA:-$ZATHURA}
 HISTORY=${ZBUF_HISTORY:-${XDG_DATA_HOME:-$HOME/.local/share}/zathura/bookmarks.sqlite}
+# the buffer list as it was when the last session closed
+SAVED=${ZBUF_SAVED:-${XDG_STATE_HOME:-$HOME/.local/state}/zbuf/buffers}
+KEEP_DAYS=${ZBUF_KEEP_DAYS:-30}
 # zbuf-index.c, built by install.sh and preloaded into zbuf's zathura only
 case $(uname) in
 Darwin) PLUGIN=$HERE/zbuf-index.dylib PRELOAD=DYLD_INSERT_LIBRARIES ;;
 *) PLUGIN=$HERE/zbuf-index.so PRELOAD=LD_PRELOAD ;;
 esac
+# the WebKit EPUB plugin (zathura-epub-webkit/), if it's built: EPUBs open
+# through WebKit, so MathML and modern CSS render; MuPDF keeps PDFs
+EPUB_PLUGIN=${ZBUF_EPUB_PLUGIN:-$HERE/zathura-epub-webkit/plugin}
 # INT_MIN tells OpenDocument to restore the page from zathura's history
 PAGE_FROM_HISTORY=-2147483648
 
@@ -130,6 +139,22 @@ last_read() {
     done
 }
 
+# the last session's buffers that still exist and were read recently, oldest
+# first. "Read" is when zathura's history last closed the file (it does on
+# every switch), or failing that when the session ended
+saved_buffers() {
+  [ -s "$SAVED" ] || return 0
+  ended=$(stat -c %Y "$SAVED" 2>/dev/null || stat -f %m "$SAVED")
+  cutoff=$(($(date +%s) - KEEP_DAYS * 86400))
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    q=$(printf '%s' "$f" | sed "s/'/''/g")
+    t=$(sqlite3 -readonly "$HISTORY" "SELECT strftime('%s', time) FROM fileinfo WHERE file = '$q'" 2>/dev/null) || t=
+    t=${t:-$ended}
+    [ "$t" -ge "$cutoff" ] 2>/dev/null && printf '%s\t%s\n' "$t" "$f"
+  done <"$SAVED" | sort -n | cut -f 2-
+}
+
 # rebuild the plugin when the source changes (or zathura's headers move on)
 build_plugin() {
   [ -f "$PLUGIN" ] && [ "$PLUGIN" -nt "$HERE/zbuf-index.c" ] && return 0
@@ -166,6 +191,12 @@ start() {
     trap '' HUP
     # the plugin takes itself back out of the environment, so what zathura runs doesn't get it
     preload=$(printenv "$PRELOAD" || true)
+    if [ -f "$EPUB_PLUGIN/libepub-webkit.dylib" ] && [ -x "$EPUB_PLUGIN/epub-webkit-helper" ]; then
+      export ZATHURA_PLUGINS_PATH="$EPUB_PLUGIN${ZATHURA_PLUGINS_PATH:+:$ZATHURA_PLUGINS_PATH}" ZBUF_EPUB_WEBKIT=1
+      # scrolling EPUBs show with no gap between pages; this is the gap to go back to
+      gap=$(sed -nE 's/^[[:space:]]*set[[:space:]]+page-v-padding[[:space:]]+"?([0-9]+).*/\1/p' "$user" 2>/dev/null | tail -n 1)
+      export ZBUF_PAGE_GAP="${gap:-1}"
+    fi
     env "$PRELOAD=$PLUGIN${preload:+:$preload}" ZBUF_DIR="$DIR" ZBUF_BIN="$SELF" \
       "$ZATHURA" -c "$DIR" >/dev/null 2>&1 &
     zpid=$!
@@ -174,6 +205,8 @@ start() {
     mv "$DIR/state.tmp" "$DIR/state"
     wait $zpid || true
     kill "$DPID" 2>/dev/null || true
+    mkdir -p "$(dirname "$SAVED")"
+    cp "$LIST" "$SAVED.tmp" && mv "$SAVED.tmp" "$SAVED"
     rm -rf "$DIR"
   ) </dev/null >/dev/null 2>&1 &
 
@@ -245,8 +278,11 @@ quit)
   if alive; then
     sync_current
   else
+    restored=$(saved_buffers)
     if [ $# -eq 0 ]; then
-      recent=$(last_read)
+      recent=${restored##*
+}
+      [ -n "$recent" ] || recent=$(last_read)
       [ -n "$recent" ] || die "nothing to reopen; give a file"
       set -- "$recent"
     fi
@@ -255,11 +291,14 @@ quit)
     done
     start
     fresh=1
+    [ -z "$restored" ] || printf '%s\n' "$restored" >"$LIST"
   fi
   last=
   for f in "$@"; do
     [ -f "$f" ] || die "no such file: $f"
     last=$(abspath "$f")
+    # in a new session what you open now is the newest, so it goes last
+    [ -n "$fresh" ] && drop "$last"
     add "$last"
   done
   if [ -n "$last" ] && ! show "$last"; then
